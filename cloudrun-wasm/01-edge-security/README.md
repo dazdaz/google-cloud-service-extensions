@@ -16,6 +16,12 @@ make build      # Build the Wasm plugin
 make test       # Run tests
 make deploy     # Deploy to Cloud Run
 make test-live  # Verify PII scrubbing works
+
+Alternatively, cd into scripts and run these in sequence.
+01-build.sh
+02-deploy.sh
+03-test.sh
+99-remove.sh
 ```
 
 ## Available Make Targets
