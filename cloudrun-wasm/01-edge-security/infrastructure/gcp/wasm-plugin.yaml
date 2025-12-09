@@ -1,0 +1,97 @@
+# WasmPlugin resource for Demo 1: PII Scrubbing
+# This plugin runs on the RESPONSE path and scrubs PII from responses
+#
+# To deploy:
+#   gcloud beta service-extensions wasm-plugins create pii-scrubbing \
+#     --location=global \
+#     --file=wasm-plugin.yaml
+
+apiVersion: networking.gcp.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: pii-scrubbing
+  labels:
+    app: demo1-edge-security
+    demo: pii-scrubbing
+spec:
+  # Plugin execution phase - runs on response path
+  phase: RESPONSE
+  
+  # Priority within the phase (lower = earlier)
+  priority: 100
+  
+  # The Wasm module source
+  source:
+    # Option 1: From GCS bucket
+    gcs:
+      bucket: "${GCS_BUCKET}"
+      object: "wasm/edge_security.wasm"
+    
+    # Option 2: Inline (for small modules)
+    # inline:
+    #   data: "<base64-encoded-wasm>"
+  
+  # Plugin configuration (JSON string)
+  pluginConfig: |
+    {
+      "log_level": "info",
+      "patterns": {
+        "credit_card": true,
+        "ssn": true,
+        "email": true,
+        "phone_us": false
+      },
+      "bypass_paths": ["/health", "/metrics"],
+      "max_body_size_bytes": 1048576
+    }
+  
+  # Selector for which routes/backends to apply to
+  selector:
+    matchLabels:
+      app: demo1-edge-security-backend
+
+---
+# Alternative gcloud command-based deployment
+# 
+# 1. Upload Wasm file to GCS:
+#    gsutil cp target/wasm32-unknown-unknown/release/edge_security.wasm \
+#      gs://${GCS_BUCKET}/wasm/edge_security.wasm
+#
+# 2. Create the WasmPlugin:
+#    gcloud beta service-extensions wasm-plugins create pii-scrubbing \
+#      --location=global \
+#      --image="gs://${GCS_BUCKET}/wasm/edge_security.wasm" \
+#      --plugin-config='{
+#        "log_level": "info",
+#        "patterns": {
+#          "credit_card": true,
+#          "ssn": true,
+#          "email": true,
+#          "phone_us": false
+#        },
+#        "bypass_paths": ["/health", "/metrics"],
+#        "max_body_size_bytes": 1048576
+#      }'
+#
+# 3. Create WasmPluginVersion:
+#    gcloud beta service-extensions wasm-plugin-versions create v1 \
+#      --wasm-plugin=pii-scrubbing \
+#      --location=global \
+#      --image="gs://${GCS_BUCKET}/wasm/edge_security.wasm"
+#
+# 4. Attach to backend service (via Traffic Extension):
+#    gcloud beta service-extensions traffic-extensions create pii-scrubbing-extension \
+#      --location=global \
+#      --load-balancing-scheme=EXTERNAL_MANAGED \
+#      --forwarding-rules=demo1-https-rule \
+#      --extension-chains='[{
+#        "name": "pii-chain",
+#        "matchCondition": {"celExpression": "true"},
+#        "extensions": [{
+#          "name": "pii-scrubbing",
+#          "authority": "pii-scrubbing.example.com",
+#          "service": "projects/${PROJECT_ID}/locations/global/wasmPlugins/pii-scrubbing",
+#          "failOpen": false,
+#          "timeout": "0.5s"
+#        }]
+#      }]'

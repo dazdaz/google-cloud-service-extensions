@@ -1,0 +1,46 @@
+[package]
+name = "edge_security"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "PII scrubbing Wasm filter for GCP Service Extensions"
+authors = ["cloudrun-wasm-demos"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Proxy-Wasm SDK for building Envoy/GCP Service Extensions filters
+proxy-wasm = "0.2"
+
+# Logging support
+log = "0.4"
+
+# JSON parsing for configuration
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# NOTE: regex and lazy_static are NOT compatible with GCP Service Extensions
+# WASM runtime - they cause TerminationException panics. We use simple
+# string matching instead.
+
+[dev-dependencies]
+# Testing utilities (if available for wasm)
+
+[profile.release]
+# Optimize for size - important for Wasm
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "deny"
+pedantic = "warn"
+# Allow some pedantic lints that are too strict
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"

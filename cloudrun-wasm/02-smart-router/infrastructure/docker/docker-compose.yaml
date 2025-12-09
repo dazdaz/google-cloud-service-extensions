@@ -1,0 +1,49 @@
+# Docker Compose for Demo 2: Smart Router (A/B Testing)
+# Local development environment for testing the Smart Router Wasm filter
+
+version: "3.8"
+
+services:
+  # Envoy Proxy with Smart Router Wasm Filter
+  envoy:
+    build:
+      context: .
+      dockerfile: Dockerfile.envoy
+    container_name: demo2-envoy
+    ports:
+      - "10000:10000"   # Main listener
+      - "9901:9901"     # Admin interface
+    volumes:
+      - ../envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+      - ../../:/etc/envoy/wasm:ro
+    depends_on:
+      - backend
+    networks:
+      - demo2-network
+    environment:
+      - ENVOY_LOG_LEVEL=info
+
+  # Mock Backend (Flask) - Versioned endpoints only
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: demo2-backend
+    ports:
+      - "8080:8080"
+    networks:
+      - demo2-network
+    environment:
+      - FLASK_ENV=development
+      - PORT=8080
+      - LOG_LEVEL=debug
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+networks:
+  demo2-network:
+    driver: bridge

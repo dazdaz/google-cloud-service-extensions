@@ -1,0 +1,134 @@
+# Cloud Build configuration for Demo 2: Smart Router (A/B Testing)
+# Builds Go Wasm plugin with TinyGo and Python backend container
+
+# Substitutions (can be overridden):
+#   _REGION: Target region (default: us-central1)
+#   _ARTIFACT_REPO: Artifact Registry repository name
+#   _TAG: Image tag (default: latest)
+substitutions:
+  _REGION: us-central1
+  _ARTIFACT_REPO: demo2-smart-router
+  _TAG: latest
+
+steps:
+  # Step 1: Build Rust Wasm plugin
+  - name: 'rust:latest'
+    id: 'build-wasm'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        rustup target add wasm32-wasip1
+        cd cloudrun-wasm/02-smart-router
+        # Check if Cargo.toml exists
+        if [ ! -f Cargo.toml ]; then
+          echo "Error: Cargo.toml not found in $(pwd)"
+          ls -la
+          exit 1
+        fi
+        
+        # Build
+        cargo build --target wasm32-wasip1 --release
+        
+        # Verify output
+        ls -lh target/wasm32-wasip1/release/smart_router.wasm
+
+
+
+  # Step 3: Build backend Docker image
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-backend'
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPO}/demo2-backend:${_TAG}'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPO}/demo2-backend:latest'
+      - 'cloudrun-wasm/02-smart-router/infrastructure/backend'
+    waitFor: ['-']  # Start immediately, don't wait for wasm
+
+  # Step 4: Push backend image to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-backend'
+    args:
+      - 'push'
+      - '--all-tags'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPO}/demo2-backend'
+    waitFor: ['build-backend']
+
+  # Step 5: Upload Wasm to GCS (for backup/reference)
+  - name: 'gcr.io/cloud-builders/gsutil'
+    id: 'upload-wasm-gcs'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        BUCKET="$PROJECT_ID-wasm-plugins"
+        # Create bucket if it doesn't exist
+        gsutil ls gs://$$BUCKET 2>/dev/null || gsutil mb -l ${_REGION} gs://$$BUCKET
+        # Upload wasm file
+        gsutil cp cloudrun-wasm/02-smart-router/target/wasm32-wasip1/release/smart_router.wasm \
+          gs://$$BUCKET/demo2/smart_router.wasm
+        gsutil cp cloudrun-wasm/02-smart-router/target/wasm32-wasip1/release/smart_router.wasm \
+          gs://$$BUCKET/demo2/smart_router-${_TAG}.wasm
+        echo "Uploaded to: gs://$$BUCKET/demo2/smart_router.wasm"
+    waitFor: ['build-wasm']
+
+  # Step 6: Package Wasm as OCI image for Service Extensions
+  # Service Extensions requires an OCI image, not a GCS path
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-wasm-oci'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        # Create a minimal Dockerfile for the WASM
+        cat > /tmp/Dockerfile.wasm << 'DOCKERFILE'
+        FROM scratch
+        COPY smart_router.wasm /plugin.wasm
+        DOCKERFILE
+        
+        # Copy the wasm file to tmp
+        cp cloudrun-wasm/02-smart-router/target/wasm32-wasip1/release/smart_router.wasm /tmp/
+        
+        # Build the OCI image
+        cd /tmp
+        docker build -f Dockerfile.wasm \
+          -t ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPO}/demo2-wasm:${_TAG} \
+          -t ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPO}/demo2-wasm:latest \
+          .
+    waitFor: ['build-wasm']
+
+  # Step 7: Push Wasm OCI image
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-wasm-oci'
+    args:
+      - 'push'
+      - '--all-tags'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPO}/demo2-wasm'
+    waitFor: ['build-wasm-oci']
+
+# Artifacts to store
+artifacts:
+  objects:
+    location: 'gs://${PROJECT_ID}-wasm-plugins/demo2/builds/$BUILD_ID/'
+    paths:
+      - 'cloudrun-wasm/02-smart-router/target/wasm32-wasip1/release/smart_router.wasm'
+
+# Images to push (already handled in steps, but good for logging)
+images:
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPO}/demo2-backend:${_TAG}'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPO}/demo2-backend:latest'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPO}/demo2-wasm:${_TAG}'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPO}/demo2-wasm:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'
+
+timeout: '1200s'  # 20 minutes
+
+tags:
+  - 'demo2'
+  - 'smart-router'
+  - 'wasm'

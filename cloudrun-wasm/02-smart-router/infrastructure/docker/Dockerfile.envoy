@@ -1,0 +1,24 @@
+# Dockerfile for Envoy Proxy with Wasm Support - Demo 2
+# Based on official Envoy image with V8 Wasm runtime
+
+FROM envoyproxy/envoy:v1.28-latest
+
+# Labels for identification
+LABEL maintainer="cloudrun-wasm-demos"
+LABEL description="Envoy Proxy with Smart Router Wasm filter for Demo 2"
+
+# Create directory for Wasm plugins
+RUN mkdir -p /etc/envoy/wasm
+
+# Expose ports
+# 10000: Main HTTP listener
+# 9901: Admin interface
+EXPOSE 10000 9901
+
+# Health check using admin interface
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:9901/ready || exit 1
+
+# Run Envoy with the config file
+ENTRYPOINT ["/usr/local/bin/envoy"]
+CMD ["-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]

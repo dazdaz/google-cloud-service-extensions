@@ -1,0 +1,133 @@
+# Cloud Build configuration for Demo 1: Edge Security
+# Builds Rust Wasm plugin and Python backend container
+
+# Substitutions (can be overridden):
+#   _REGION: Target region (default: us-central1)
+#   _ARTIFACT_REPO: Artifact Registry repository name
+#   _TAG: Image tag (default: latest)
+substitutions:
+  _REGION: us-central1
+  _ARTIFACT_REPO: demo1-edge-security
+  _TAG: latest
+
+steps:
+  # Step 1: Build Rust Wasm plugin
+  - name: 'rust:latest'
+    id: 'build-wasm'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        rustup target add wasm32-unknown-unknown
+        cd cloudrun-wasm/01-edge-security
+        cargo build --target wasm32-unknown-unknown --release
+        ls -lh target/wasm32-unknown-unknown/release/edge_security.wasm
+
+  # Step 2: Run tests
+  - name: 'rust:latest'
+    id: 'test-wasm'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        cd cloudrun-wasm/01-edge-security
+        cargo test
+    waitFor: ['build-wasm']
+
+  # Step 3: Build backend Docker image
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-backend'
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPO}/demo1-backend:${_TAG}'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPO}/demo1-backend:latest'
+      - 'cloudrun-wasm/01-edge-security/infrastructure/backend'
+    waitFor: ['-']  # Start immediately, don't wait for wasm
+
+  # Step 4: Push backend image to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-backend'
+    args:
+      - 'push'
+      - '--all-tags'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPO}/demo1-backend'
+    waitFor: ['build-backend']
+
+  # Step 5: Upload Wasm to GCS (for backup/reference)
+  - name: 'gcr.io/cloud-builders/gsutil'
+    id: 'upload-wasm-gcs'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        BUCKET="$PROJECT_ID-wasm-plugins"
+        # Create bucket if it doesn't exist
+        gsutil ls gs://$$BUCKET 2>/dev/null || gsutil mb -l ${_REGION} gs://$$BUCKET
+        # Upload wasm file
+        gsutil cp cloudrun-wasm/01-edge-security/target/wasm32-unknown-unknown/release/edge_security.wasm \
+          gs://$$BUCKET/demo1/edge_security.wasm
+        gsutil cp cloudrun-wasm/01-edge-security/target/wasm32-unknown-unknown/release/edge_security.wasm \
+          gs://$$BUCKET/demo1/edge_security-${_TAG}.wasm
+        echo "Uploaded to: gs://$$BUCKET/demo1/edge_security.wasm"
+    waitFor: ['build-wasm', 'test-wasm']
+
+  # Step 6: Package Wasm as OCI image for Service Extensions
+  # Service Extensions requires an OCI image, not a GCS path
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-wasm-oci'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        # Create a minimal Dockerfile for the WASM
+        cat > /tmp/Dockerfile.wasm << 'DOCKERFILE'
+        FROM scratch
+        COPY edge_security.wasm /plugin.wasm
+        DOCKERFILE
+        
+        # Copy the wasm file to tmp
+        cp cloudrun-wasm/01-edge-security/target/wasm32-unknown-unknown/release/edge_security.wasm /tmp/
+        
+        # Build the OCI image
+        cd /tmp
+        docker build -f Dockerfile.wasm \
+          -t ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPO}/demo1-wasm:${_TAG} \
+          -t ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPO}/demo1-wasm:latest \
+          .
+    waitFor: ['build-wasm', 'test-wasm']
+
+  # Step 7: Push Wasm OCI image
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-wasm-oci'
+    args:
+      - 'push'
+      - '--all-tags'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPO}/demo1-wasm'
+    waitFor: ['build-wasm-oci']
+
+# Artifacts to store
+artifacts:
+  objects:
+    location: 'gs://${PROJECT_ID}-wasm-plugins/demo1/builds/$BUILD_ID/'
+    paths:
+      - 'cloudrun-wasm/01-edge-security/target/wasm32-unknown-unknown/release/edge_security.wasm'
+
+# Images to push (already handled in steps, but good for logging)
+images:
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPO}/demo1-backend:${_TAG}'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPO}/demo1-backend:latest'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPO}/demo1-wasm:${_TAG}'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPO}/demo1-wasm:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'
+
+timeout: '1200s'  # 20 minutes
+
+tags:
+  - 'demo1'
+  - 'edge-security'
+  - 'wasm'

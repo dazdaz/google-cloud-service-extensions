@@ -1,0 +1,85 @@
+# Envoy Configuration for Demo 1: Edge Security (PII Scrubbing)
+# This config adds the PII scrubbing Wasm filter on the RESPONSE path
+# Port: 10000
+
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 9901
+
+static_resources:
+  listeners:
+    - name: main
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10000
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: AUTO
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: backend_service
+                            timeout: 30s
+                http_filters:
+                  # Demo 1: PII Scrubbing Wasm Filter (Response Path)
+                  - name: envoy.filters.http.wasm
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+                      config:
+                        name: "pii_scrubbing"
+                        root_id: "pii_scrubbing_root"
+                        vm_config:
+                          runtime: "envoy.wasm.runtime.v8"
+                          code:
+                            local:
+                              filename: "/etc/envoy/wasm/edge_security.wasm"
+                          allow_precompiled: false
+                        configuration:
+                          "@type": type.googleapis.com/google.protobuf.StringValue
+                          value: |
+                            {
+                              "log_level": "info",
+                              "patterns": {
+                                "credit_card": true,
+                                "ssn": true,
+                                "email": true,
+                                "phone_us": false
+                              },
+                              "bypass_paths": ["/health", "/metrics"],
+                              "max_body_size_bytes": 1048576
+                            }
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: backend_service
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      connect_timeout: 5s
+      load_assignment:
+        cluster_name: backend_service
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: backend
+                      port_value: 8080

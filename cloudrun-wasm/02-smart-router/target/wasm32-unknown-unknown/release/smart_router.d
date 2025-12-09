@@ -1,0 +1,1 @@
+/Users/aicoder/src/google-cloud-serverless/cloudrun-wasm/02-smart-router/target/wasm32-unknown-unknown/release/smart_router.wasm: /Users/aicoder/src/google-cloud-serverless/cloudrun-wasm/02-smart-router/src/lib.rs

@@ -1,0 +1,124 @@
+# WasmPlugin resource for Demo 2: Smart Router
+# This plugin runs on the REQUEST path and routes traffic based on user attributes
+#
+# To deploy:
+#   gcloud beta service-extensions wasm-plugins create smart-router \
+#     --location=global \
+#     --file=wasm-plugin.yaml
+
+apiVersion: networking.gcp.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: smart-router
+  labels:
+    app: demo2-smart-router
+    demo: ab-testing
+spec:
+  # Plugin execution phase - runs on request path
+  phase: REQUEST
+  
+  # Priority within the phase (lower = earlier)
+  priority: 100
+  
+  # The Wasm module source
+  source:
+    # Option 1: From GCS bucket
+    gcs:
+      bucket: "${GCS_BUCKET}"
+      object: "wasm/smart_router.wasm"
+  
+  # Plugin configuration (JSON string)
+  pluginConfig: |
+    {
+      "log_level": "info",
+      "default_target": "v1",
+      "rules": [
+        {
+          "name": "beta-testers",
+          "priority": 1,
+          "conditions": [
+            {
+              "type": "header",
+              "key": "User-Agent",
+              "operator": "contains",
+              "value": "iPhone"
+            },
+            {
+              "type": "header",
+              "key": "X-Geo-Country",
+              "operator": "equals",
+              "value": "DE"
+            },
+            {
+              "type": "cookie",
+              "key": "beta-tester",
+              "operator": "equals",
+              "value": "true"
+            }
+          ],
+          "target": "v2",
+          "add_headers": {
+            "X-Routed-By": "smart-router",
+            "X-Route-Reason": "beta-tester-match"
+          }
+        },
+        {
+          "name": "canary-10-percent",
+          "priority": 2,
+          "conditions": [
+            {
+              "type": "header",
+              "key": "X-Request-Hash",
+              "operator": "regex",
+              "value": "^[0-9]$"
+            }
+          ],
+          "target": "v2",
+          "add_headers": {
+            "X-Routed-By": "smart-router",
+            "X-Route-Reason": "canary"
+          }
+        }
+      ]
+    }
+  
+  # Selector for which routes/backends to apply to
+  selector:
+    matchLabels:
+      app: demo2-smart-router-backend
+
+---
+# Alternative gcloud command-based deployment
+# 
+# 1. Upload Wasm file to GCS:
+#    gsutil cp smart_router.wasm \
+#      gs://${GCS_BUCKET}/wasm/smart_router.wasm
+#
+# 2. Create the WasmPlugin:
+#    gcloud beta service-extensions wasm-plugins create smart-router \
+#      --location=global \
+#      --image="gs://${GCS_BUCKET}/wasm/smart_router.wasm" \
+#      --plugin-config='<config-json>'
+#
+# 3. Create WasmPluginVersion:
+#    gcloud beta service-extensions wasm-plugin-versions create v1 \
+#      --wasm-plugin=smart-router \
+#      --location=global \
+#      --image="gs://${GCS_BUCKET}/wasm/smart_router.wasm"
+#
+# 4. Attach to backend service (via Traffic Extension):
+#    gcloud beta service-extensions traffic-extensions create smart-router-extension \
+#      --location=global \
+#      --load-balancing-scheme=EXTERNAL_MANAGED \
+#      --forwarding-rules=demo2-https-rule \
+#      --extension-chains='[{
+#        "name": "router-chain",
+#        "matchCondition": {"celExpression": "true"},
+#        "extensions": [{
+#          "name": "smart-router",
+#          "authority": "smart-router.example.com",
+#          "service": "projects/${PROJECT_ID}/locations/global/wasmPlugins/smart-router",
+#          "failOpen": false,
+#          "timeout": "0.1s"
+#        }]
+#      }]'

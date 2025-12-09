@@ -1,0 +1,144 @@
+# Envoy Configuration for Demo 2: Smart Router (A/B Testing)
+# This config adds the Smart Router Wasm filter on the REQUEST path
+# Port: 10000
+
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 9901
+
+static_resources:
+  listeners:
+    - name: main
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 10000
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: AUTO
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        # Route to v2 backend when header is set by Wasm
+                        - match:
+                            prefix: "/"
+                            headers:
+                              - name: "x-route-target"
+                                exact_match: "v2"
+                          route:
+                            cluster: backend_v2
+                            timeout: 30s
+                        # Default route to v1 backend
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: backend_v1
+                            timeout: 30s
+                http_filters:
+                  # Demo 2: Smart Router Wasm Filter (Request Path)
+                  - name: envoy.filters.http.wasm
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+                      config:
+                        name: "smart_router"
+                        root_id: "smart_router_root"
+                        vm_config:
+                          runtime: "envoy.wasm.runtime.v8"
+                          code:
+                            local:
+                              filename: "/etc/envoy/wasm/smart_router.wasm"
+                          allow_precompiled: false
+                        configuration:
+                          "@type": type.googleapis.com/google.protobuf.StringValue
+                          value: |
+                            {
+                              "log_level": "info",
+                              "default_target": "v1",
+                              "rules": [
+                                {
+                                  "name": "beta-testers",
+                                  "priority": 1,
+                                  "conditions": [
+                                    {
+                                      "type": "header",
+                                      "key": "User-Agent",
+                                      "operator": "contains",
+                                      "value": "iPhone"
+                                    },
+                                    {
+                                      "type": "header",
+                                      "key": "X-Geo-Country",
+                                      "operator": "equals",
+                                      "value": "DE"
+                                    },
+                                    {
+                                      "type": "cookie",
+                                      "key": "beta-tester",
+                                      "operator": "equals",
+                                      "value": "true"
+                                    }
+                                  ],
+                                  "target": "v2"
+                                },
+                                {
+                                  "name": "canary-10-percent",
+                                  "priority": 2,
+                                  "conditions": [
+                                    {
+                                      "type": "header",
+                                      "key": "X-Request-Hash",
+                                      "operator": "regex",
+                                      "value": "^[0-9]$"
+                                    }
+                                  ],
+                                  "target": "v2"
+                                }
+                              ]
+                            }
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    # V1 Backend (Stable)
+    - name: backend_v1
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      connect_timeout: 5s
+      load_assignment:
+        cluster_name: backend_v1
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: backend
+                      port_value: 8080
+    
+    # V2 Backend (Beta) - Same backend, different path handling
+    - name: backend_v2
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      connect_timeout: 5s
+      load_assignment:
+        cluster_name: backend_v2
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: backend
+                      port_value: 8080
