@@ -254,13 +254,12 @@ See [DATA_STRUCTURES.md](../DATA_STRUCTURES.md#demo-1-pii-test-cases) for compre
 │   ├── lib.rs              # Main plugin implementation
 │   └── patterns.rs         # PII pattern definitions
 ├── scripts/
-│   ├── deploy.sh           # Deployment script
-│   ├── 99-remove.sh        # Cleanup script
-│   ├── setup-dev.sh        # Development setup
-│   └── test.sh             # Test runner
+│   ├── 01-build.sh         # Build script
+│   ├── 02-deploy.sh        # Deployment script
+│   ├── 03-test.sh          # Test runner
+│   └── 99-remove.sh        # Cleanup script
 └── infrastructure/
     ├── backend/            # Python Flask backend
-    ├── docker/             # Docker compose for local testing
     ├── envoy/              # Envoy configuration
     └── gcp/                # GCP Load Balancer config
 ```
@@ -290,12 +289,32 @@ See [DATA_STRUCTURES.md](../DATA_STRUCTURES.md#demo-1-pii-test-cases) for compre
 
 ### Performance Considerations
 
-- **Pure Rust string matching** - No external regex libraries (GCP Service Extensions compatible)
-- **Minimal WASM size** - ~230KB compiled binary
+- **regex-lite with OnceLock** - Patterns compiled once at startup, reused for all requests
+- **Optimized for Wasm** - Uses regex-lite instead of regex crate (~500KB smaller binary)
 - **Sub-100ms overhead** - WASM processing adds minimal latency
 - Body is buffered only when needed for modification
 - Large bodies (>1MB) skip processing
 - Binary content types are ignored
+
+### Technical Deep Dive: Regex in Wasm Extensions
+
+GCP Service Extensions have strict CPU budgets (~1-2ms). Regex compilation is expensive, so patterns must be compiled once and reused:
+
+```rust
+// ✅ GOOD: Compiles once, runs everywhere
+static API_PATH: OnceLock<Regex> = OnceLock::new();
+
+fn on_http_request_headers(...) {
+    let re = API_PATH.get_or_init(|| Regex::new(r"^/api/v1/.*").unwrap());
+    // ...
+}
+
+// ❌ BAD: This burns CPU cycles on every single request
+fn on_http_request_headers(...) {
+    let re = Regex::new(r"^/api/v1/.*").unwrap();
+    // ...
+}
+```
 
 ## Troubleshooting
 
@@ -331,7 +350,7 @@ docker logs envoy-demo1 2>&1 | grep -i wasm
 
 | Error | Cause | Solution |
 |-------|-------|----------|
-| `TerminationException` | Incompatible library (e.g., `regex` crate) | Use pure Rust string matching |
+| `TerminationException` | Incompatible library (e.g., full `regex` crate) | Use `regex-lite` crate (works in GCP Service Extensions) |
 | `unexpected status: 2` | Adding headers in `on_http_response_body` | Move header additions to `on_http_response_headers` |
 | `Callback timeout` | WASM execution too slow | Optimize patterns, reduce body size limit |
 
@@ -377,7 +396,7 @@ This removes:
 
 - **Organization Policy**: If your GCP org blocks `allUsers` access, use authenticated requests via `make test-live`
 - **Wasm at Edge**: The Wasm filter runs in the Load Balancer, not Cloud Run directly. See `infrastructure/gcp/` for Load Balancer configuration.
-- **GCP Service Extensions Limitations**: The `regex` crate is NOT compatible with GCP Service Extensions WASM runtime. This plugin uses pure Rust string matching instead.
+- **regex-lite Works**: Unlike the full `regex` crate, `regex-lite` is fully compatible with GCP Service Extensions. This plugin uses `regex-lite` with `OnceLock` for efficient pattern matching (~500KB smaller than `regex`).
 
 ## Related Documentation
 

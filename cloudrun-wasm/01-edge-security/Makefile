@@ -50,10 +50,6 @@ test-verbose:
 	@echo "Running tests (verbose)..."
 	$(CARGO) test -- --nocapture
 
-## test-all: Run all tests (unit + integration via Cloud Build)
-test-all:
-	@./scripts/test.sh --all
-
 # =============================================================================
 # Code Quality Targets
 # =============================================================================
@@ -82,60 +78,15 @@ check: fmt-check lint test
 
 ## deploy: Deploy to Cloud Run using Cloud Build (requires GCP credentials)
 deploy: build
-	@./scripts/deploy.sh
+	@./scripts/02-deploy.sh
 
 ## deploy-skip-build: Deploy without rebuilding (use existing image)
 deploy-skip-build:
-	@./scripts/deploy.sh --skip-build
+	@./scripts/02-deploy.sh --skip-build
 
 ## test-live: Test deployed Cloud Run service (with authentication)
 test-live:
-	@echo "Testing deployed service with authentication..."
-	@echo ""
-	@echo "=========================================="
-	@echo "1. CLOUD RUN DIRECT (no WASM filter)"
-	@echo "=========================================="
-	@SERVICE_URL=$$(gcloud run services describe demo1-edge-security-backend \
-		--region=us-central1 --format='value(status.url)' 2>/dev/null) && \
-	echo "Service URL: $$SERVICE_URL" && \
-	echo "" && \
-	echo "Health check:" && \
-	curl -s -H "Authorization: Bearer $$(gcloud auth print-identity-token)" "$$SERVICE_URL/health" | jq . && \
-	echo "" && \
-	echo "User endpoint (PII NOT scrubbed - direct to backend):" && \
-	DIRECT_TIME=$$(curl -s -o /tmp/direct_response.json -w "%{time_total}" -H "Authorization: Bearer $$(gcloud auth print-identity-token)" "$$SERVICE_URL/api/user") && \
-	cat /tmp/direct_response.json | jq . && \
-	echo "" && \
-	echo "⏱️  Direct latency: $${DIRECT_TIME}s"
-	@echo ""
-	@echo "=========================================="
-	@echo "2. LOAD BALANCER (with WASM filter)"
-	@echo "=========================================="
-	@LB_IP=$$(gcloud compute addresses describe demo1-edge-security-lb-ip \
-		--global --format='value(address)' 2>/dev/null || echo ""); \
-	if [ -n "$$LB_IP" ]; then \
-		echo "Load Balancer IP: $$LB_IP"; \
-		echo ""; \
-		ID_TOKEN=$$(gcloud auth print-identity-token); \
-		echo "Health check (via LB):"; \
-		curl -s -k -H "Authorization: Bearer $$ID_TOKEN" "https://$$LB_IP/health" 2>/dev/null | jq . || echo "  (LB health check failed - is WASM plugin deployed?)"; \
-		echo ""; \
-		echo "User endpoint (PII SHOULD be scrubbed by WASM):"; \
-		LB_TIME=$$(curl -s -k -H "Authorization: Bearer $$ID_TOKEN" -o /tmp/lb_response.txt -w "%{time_total}" -D /tmp/lb_headers.txt "https://$$LB_IP/api/user" 2>/dev/null); \
-		cat /tmp/lb_response.txt | jq . 2>/dev/null || cat /tmp/lb_response.txt; \
-		echo ""; \
-		echo "⏱️  LB + WASM latency: $${LB_TIME}s"; \
-		echo ""; \
-		echo "Response headers (WASM indicator):"; \
-		grep -i "x-wasm" /tmp/lb_headers.txt 2>/dev/null || echo "  (No WASM headers found)"; \
-	else \
-		echo "Load Balancer not found."; \
-		echo ""; \
-		echo "To deploy the Load Balancer with WASM plugin:"; \
-		echo "  1. cd infrastructure/gcp"; \
-		echo "  2. terraform init && terraform apply"; \
-		echo "  3. Deploy WASM plugin (see wasm-plugin.yaml)"; \
-	fi
+	@./scripts/03-test.sh
 
 ## destroy: Destroy all Demo 1 GCP infrastructure
 destroy:

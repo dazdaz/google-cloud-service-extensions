@@ -1,13 +1,91 @@
 //! PII Pattern Matching and Redaction
 //!
-//! This module contains simple string-based patterns for detecting PII
-//! and the logic for redacting matched content.
+//! This module uses regex-lite for efficient PII pattern matching.
+//! Patterns are compiled once using OnceLock for optimal performance
+//! in the Wasm sandbox's strict CPU budget (~1-2ms).
 //!
-//! NOTE: We use simple character-by-character matching instead of regex
-//! because the regex crate is not compatible with GCP Service Extensions
-//! WASM runtime (causes TerminationException panic).
+//! # Technical Deep Dive: Using Regex in Wasm Extensions
+//!
+//! When building custom validators using Service Extensions (Proxy-Wasm),
+//! the strict resource constraints of the sandbox require efficient memory
+//! management. The key constraint is that regex compilation (Regex::new)
+//! is expensive and must NOT happen in the request path.
+//!
+//! ## The Golden Pattern: Global Initialization with OnceLock
+//!
+//! ```rust,ignore
+//! static PATTERN: OnceLock<Regex> = OnceLock::new();
+//!
+//! fn on_http_request_headers(...) {
+//!     let re = PATTERN.get_or_init(|| Regex::new(r"...").unwrap());
+//!     // ... use re
+//! }
+//! ```
+//!
+//! We use regex-lite instead of regex to reduce Wasm binary size by ~500KB.
 
+use regex_lite::Regex;
 use std::collections::HashSet;
+use std::sync::OnceLock;
+
+// =============================================================================
+// Global Pattern Cache (compiled once, reused everywhere)
+// =============================================================================
+
+/// Credit card with dashes: 4111-1111-1111-1111
+static CREDIT_CARD_DASHES: OnceLock<Regex> = OnceLock::new();
+
+/// Credit card without dashes: 4111111111111111 (16 consecutive digits)
+static CREDIT_CARD_NO_DASHES: OnceLock<Regex> = OnceLock::new();
+
+/// SSN: 123-45-6789
+static SSN_PATTERN: OnceLock<Regex> = OnceLock::new();
+
+/// Email: user@example.com
+static EMAIL_PATTERN: OnceLock<Regex> = OnceLock::new();
+
+/// US Phone: 555-123-4567 or 555.123.4567
+static PHONE_US_PATTERN: OnceLock<Regex> = OnceLock::new();
+
+/// Get the credit card (with dashes) regex, compiling it once if needed
+fn credit_card_dashes_regex() -> &'static Regex {
+    CREDIT_CARD_DASHES.get_or_init(|| {
+        // Matches: 4111-1111-1111-1111
+        Regex::new(r"\b(\d{4})-(\d{4})-(\d{4})-(\d{4})\b").unwrap()
+    })
+}
+
+/// Get the credit card (no dashes) regex, compiling it once if needed
+fn credit_card_no_dashes_regex() -> &'static Regex {
+    CREDIT_CARD_NO_DASHES.get_or_init(|| {
+        // Matches: 4111111111111111 (exactly 16 digits, not part of longer number)
+        Regex::new(r"\b(\d{12})(\d{4})\b").unwrap()
+    })
+}
+
+/// Get the SSN regex, compiling it once if needed
+fn ssn_regex() -> &'static Regex {
+    SSN_PATTERN.get_or_init(|| {
+        // Matches: 123-45-6789
+        Regex::new(r"\b\d{3}-\d{2}-\d{4}\b").unwrap()
+    })
+}
+
+/// Get the email regex, compiling it once if needed
+fn email_regex() -> &'static Regex {
+    EMAIL_PATTERN.get_or_init(|| {
+        // Matches: user@example.com, john.doe+tag@sub.domain.org
+        Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}").unwrap()
+    })
+}
+
+/// Get the US phone regex, compiling it once if needed
+fn phone_us_regex() -> &'static Regex {
+    PHONE_US_PATTERN.get_or_init(|| {
+        // Matches: 555-123-4567 or 555.123.4567
+        Regex::new(r"\b(\d{3})[-.](\d{3})[-.](\d{4})\b").unwrap()
+    })
+}
 
 // =============================================================================
 // Pattern Matcher
@@ -129,279 +207,69 @@ impl PiiPatternMatcher {
 }
 
 // =============================================================================
-// Pattern Matching Functions (No Regex)
+// Pattern Matching Functions using regex-lite
 // =============================================================================
 
-/// Check if a character is a digit
-fn is_digit(c: char) -> bool {
-    c.is_ascii_digit()
-}
-
-/// Redact credit card numbers in format: 1234-5678-9012-3456
-/// Replaces with: XXXX-XXXX-XXXX-3456 (preserves last 4 digits)
+/// Redact credit card numbers
+/// - Format: 1234-5678-9012-3456 → XXXX-XXXX-XXXX-3456
+/// - Format: 1234567890123456 → XXXXXXXXXXXX3456
 fn redact_credit_cards(input: &str) -> (String, u32) {
-    let mut result = String::with_capacity(input.len());
-    let chars: Vec<char> = input.chars().collect();
-    let mut i = 0;
-    let mut count = 0;
+    let mut count = 0u32;
 
-    while i < chars.len() {
-        // Try to match credit card pattern: DDDD-DDDD-DDDD-DDDD
-        if i + 18 < chars.len() {
-            let potential_cc: String = chars[i..i + 19].iter().collect();
-            if is_credit_card_format(&potential_cc) {
-                // Extract last 4 digits and redact
-                let last_four = &potential_cc[15..19];
-                result.push_str("XXXX-XXXX-XXXX-");
-                result.push_str(last_four);
-                i += 19;
-                count += 1;
-                continue;
-            }
-        }
+    // First handle dashed format: 4111-1111-1111-1111 → XXXX-XXXX-XXXX-1111
+    let re_dashes = credit_card_dashes_regex();
+    let result = re_dashes.replace_all(input, |caps: &regex_lite::Captures| {
+        count += 1;
+        format!("XXXX-XXXX-XXXX-{}", &caps[4])
+    });
 
-        // Try to match credit card without dashes: 16 consecutive digits
-        if i + 15 < chars.len() {
-            let all_digits = chars[i..i + 16].iter().all(|c| is_digit(*c));
-            if all_digits {
-                // Check it's not part of a longer number
-                let before_ok = i == 0 || !is_digit(chars[i - 1]);
-                let after_ok = i + 16 >= chars.len() || !is_digit(chars[i + 16]);
-                if before_ok && after_ok {
-                    let last_four: String = chars[i + 12..i + 16].iter().collect();
-                    result.push_str("XXXXXXXXXXXX");
-                    result.push_str(&last_four);
-                    i += 16;
-                    count += 1;
-                    continue;
-                }
-            }
-        }
+    // Then handle no-dash format: 4111111111111111 → XXXXXXXXXXXX1111
+    let re_no_dashes = credit_card_no_dashes_regex();
+    let result = re_no_dashes.replace_all(&result, |caps: &regex_lite::Captures| {
+        count += 1;
+        format!("XXXXXXXXXXXX{}", &caps[2])
+    });
 
-        result.push(chars[i]);
-        i += 1;
-    }
-
-    (result, count)
+    (result.into_owned(), count)
 }
 
-/// Check if string matches DDDD-DDDD-DDDD-DDDD format
-fn is_credit_card_format(s: &str) -> bool {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() != 19 {
-        return false;
-    }
-
-    // Check pattern: 4 digits, dash, 4 digits, dash, 4 digits, dash, 4 digits
-    for (idx, c) in chars.iter().enumerate() {
-        match idx {
-            4 | 9 | 14 => {
-                if *c != '-' {
-                    return false;
-                }
-            }
-            _ => {
-                if !is_digit(*c) {
-                    return false;
-                }
-            }
-        }
-    }
-    true
-}
-
-/// Redact SSN numbers in format: 123-45-6789
-/// Replaces with: XXX-XX-XXXX
+/// Redact SSN numbers: 123-45-6789 → XXX-XX-XXXX
 fn redact_ssn(input: &str) -> (String, u32) {
-    let mut result = String::with_capacity(input.len());
-    let chars: Vec<char> = input.chars().collect();
-    let mut i = 0;
-    let mut count = 0;
+    let re = ssn_regex();
+    let mut count = 0u32;
 
-    while i < chars.len() {
-        // Try to match SSN pattern: DDD-DD-DDDD (11 chars)
-        if i + 10 < chars.len() {
-            let potential_ssn: String = chars[i..i + 11].iter().collect();
-            if is_ssn_format(&potential_ssn) {
-                // Check word boundaries
-                let before_ok = i == 0 || !chars[i - 1].is_alphanumeric();
-                let after_ok = i + 11 >= chars.len() || !chars[i + 11].is_alphanumeric();
-                if before_ok && after_ok {
-                    result.push_str("XXX-XX-XXXX");
-                    i += 11;
-                    count += 1;
-                    continue;
-                }
-            }
-        }
+    let result = re.replace_all(input, |_caps: &regex_lite::Captures| {
+        count += 1;
+        "XXX-XX-XXXX"
+    });
 
-        result.push(chars[i]);
-        i += 1;
-    }
-
-    (result, count)
+    (result.into_owned(), count)
 }
 
-/// Check if string matches DDD-DD-DDDD format
-fn is_ssn_format(s: &str) -> bool {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() != 11 {
-        return false;
-    }
-
-    // Check pattern: 3 digits, dash, 2 digits, dash, 4 digits
-    for (idx, c) in chars.iter().enumerate() {
-        match idx {
-            3 | 6 => {
-                if *c != '-' {
-                    return false;
-                }
-            }
-            _ => {
-                if !is_digit(*c) {
-                    return false;
-                }
-            }
-        }
-    }
-    true
-}
-
-/// Redact email addresses
-/// Replaces with: [EMAIL REDACTED]
+/// Redact email addresses: user@example.com → [EMAIL REDACTED]
 fn redact_email(input: &str) -> (String, u32) {
-    let mut result = String::with_capacity(input.len());
-    let chars: Vec<char> = input.chars().collect();
-    let mut i = 0;
-    let mut count = 0;
+    let re = email_regex();
+    let mut count = 0u32;
 
-    while i < chars.len() {
-        // Look for @ symbol
-        if chars[i] == '@' {
-            // Find the start of the email (local part)
-            let start = find_email_start(&chars, i);
-            // Find the end of the email (domain part)
-            let end = find_email_end(&chars, i);
+    let result = re.replace_all(input, |_caps: &regex_lite::Captures| {
+        count += 1;
+        "[EMAIL REDACTED]"
+    });
 
-            if start < i && end > i + 1 {
-                // Valid email found - check for valid domain with dot
-                let domain: String = chars[i + 1..end].iter().collect();
-                if domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.') {
-                    // Remove the local part we already added
-                    let to_remove = i - start;
-                    for _ in 0..to_remove {
-                        result.pop();
-                    }
-                    result.push_str("[EMAIL REDACTED]");
-                    i = end;
-                    count += 1;
-                    continue;
-                }
-            }
-        }
-
-        result.push(chars[i]);
-        i += 1;
-    }
-
-    (result, count)
+    (result.into_owned(), count)
 }
 
-/// Find the start index of an email address (before @)
-fn find_email_start(chars: &[char], at_pos: usize) -> usize {
-    if at_pos == 0 {
-        return at_pos;
-    }
-
-    let mut start = at_pos;
-    for j in (0..at_pos).rev() {
-        let c = chars[j];
-        if c.is_alphanumeric() || c == '.' || c == '_' || c == '%' || c == '+' || c == '-' {
-            start = j;
-        } else {
-            break;
-        }
-    }
-    start
-}
-
-/// Find the end index of an email address (after @)
-fn find_email_end(chars: &[char], at_pos: usize) -> usize {
-    let mut end = at_pos + 1;
-    for j in (at_pos + 1)..chars.len() {
-        let c = chars[j];
-        if c.is_alphanumeric() || c == '.' || c == '-' {
-            end = j + 1;
-        } else {
-            break;
-        }
-    }
-    end
-}
-
-/// Redact US phone numbers in format: 555-123-4567 or 555.123.4567
-/// Replaces with: (XXX) XXX-4567 (preserves last 4 digits)
+/// Redact US phone numbers: 555-123-4567 → (XXX) XXX-4567
 fn redact_phone_us(input: &str) -> (String, u32) {
-    let mut result = String::with_capacity(input.len());
-    let chars: Vec<char> = input.chars().collect();
-    let mut i = 0;
-    let mut count = 0;
+    let re = phone_us_regex();
+    let mut count = 0u32;
 
-    while i < chars.len() {
-        // Try to match phone pattern: DDD-DDD-DDDD or DDD.DDD.DDDD (12 chars)
-        if i + 11 < chars.len() {
-            let potential_phone: String = chars[i..i + 12].iter().collect();
-            if is_phone_format(&potential_phone) {
-                // Check word boundaries
-                let before_ok = i == 0 || !chars[i - 1].is_alphanumeric();
-                let after_ok = i + 12 >= chars.len() || !chars[i + 12].is_alphanumeric();
-                if before_ok && after_ok {
-                    let last_four = &potential_phone[8..12];
-                    result.push_str("(XXX) XXX-");
-                    result.push_str(last_four);
-                    i += 12;
-                    count += 1;
-                    continue;
-                }
-            }
-        }
+    let result = re.replace_all(input, |caps: &regex_lite::Captures| {
+        count += 1;
+        format!("(XXX) XXX-{}", &caps[3])
+    });
 
-        result.push(chars[i]);
-        i += 1;
-    }
-
-    (result, count)
-}
-
-/// Check if string matches DDD-DDD-DDDD or DDD.DDD.DDDD format
-fn is_phone_format(s: &str) -> bool {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() != 12 {
-        return false;
-    }
-
-    // Determine separator (must be consistent)
-    let sep = chars[3];
-    if sep != '-' && sep != '.' {
-        return false;
-    }
-
-    // Check pattern: 3 digits, sep, 3 digits, sep, 4 digits
-    for (idx, c) in chars.iter().enumerate() {
-        match idx {
-            3 | 7 => {
-                if *c != sep {
-                    return false;
-                }
-            }
-            _ => {
-                if !is_digit(*c) {
-                    return false;
-                }
-            }
-        }
-    }
-    true
+    (result.into_owned(), count)
 }
 
 // =============================================================================
@@ -565,6 +433,34 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&result.content),
             "Before XXX-XX-XXXX After"
+        );
+    }
+
+    #[test]
+    fn test_phone_with_dots() {
+        let matcher = PiiPatternMatcher::all();
+        let input = b"Phone: 555.123.4567";
+        let result = matcher.redact(input);
+
+        assert!(result.redacted);
+        assert!(result.matched_patterns.contains("phone_us"));
+        assert_eq!(
+            String::from_utf8_lossy(&result.content),
+            "Phone: (XXX) XXX-4567"
+        );
+    }
+
+    #[test]
+    fn test_complex_email() {
+        let matcher = PiiPatternMatcher::default_patterns();
+        let input = b"Email: john.doe+tag@sub.domain.org";
+        let result = matcher.redact(input);
+
+        assert!(result.redacted);
+        assert!(result.matched_patterns.contains("email"));
+        assert_eq!(
+            String::from_utf8_lossy(&result.content),
+            "Email: [EMAIL REDACTED]"
         );
     }
 }

@@ -1,0 +1,36 @@
+# Rust/Cargo build artifacts
+target/
+Cargo.lock
+
+# Rust intermediate files (usually in target/, but just in case)
+*.d
+*.rlib
+*.rmeta
+*.so
+*.dylib
+*.dll
+*.a
+*.o
+
+# Wasm build outputs
+*.wasm
+*.wat
+*.wasm.map
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+/tmp/
+*.tmp
